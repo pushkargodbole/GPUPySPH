@@ -183,12 +183,12 @@ class NNPSTestCase(unittest.TestCase):
         nps = self.nps
         nbrs1 = UIntArray()
         nbrs2 = UIntArray()
-
+        nbrs2_list = []
         # get the neighbors and sort the result
-        for i in range(dst_numPoints):
             nps.get_nearest_particles(src_index, dst_index, i, nbrs1)
+        for i in range(dst_numPoints):    
             nps.brute_force_neighbors(src_index, dst_index, i, nbrs2)
-
+            nbrs2_list.append(nbrs2.get_npy_array())
             # ensure that the neighbor lists are the same
             self._assert_neighbors(nbrs1, nbrs2)
 

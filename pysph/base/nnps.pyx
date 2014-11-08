@@ -12,6 +12,11 @@ from cpython.list cimport PyList_GetItem
 # Cython for compiler directives
 cimport cython
 
+# Pycuda imports
+import pycuda.gpuarray as gpuarray
+import pycuda.driver as cuda
+import pycuda.autoinit
+
 cdef extern from 'math.h':
     int abs(int)
     double ceil(double)
@@ -1089,7 +1094,6 @@ cdef class BoxSortNNPS(NNPS):
 
         # initialize the cells dict
         self.cells = {}
-
         # compute the intial box sort. First, the Domain Manager's
         # update method is called to comptue the maximum smoothing
         # length for particle binning.
@@ -1292,6 +1296,130 @@ cdef class BoxSortNNPS(NNPS):
         hi2 *= hi2
 
         cdef int ierr
+
+        # reset the nbr array length. This should avoid a realloc
+        nbrs.reset()
+
+        cdef int ix, iy, iz
+        for ix in [cid.data.x -1, cid.data.x, cid.data.x + 1]:
+            for iy in [cid.data.y - 1, cid.data.y, cid.data.y + 1]:
+                for iz in [cid.data.z - 1, cid.data.z, cid.data.z + 1]:
+                    cellid.data.x = ix; cellid.data.y = iy; cellid.data.z = iz
+
+                    ierr = PyDict_Contains( cells, cellid )
+                    if ierr == 1:
+
+                        cell = <Cell>PyDict_GetItem( cells, cellid )
+                        lindices = <UIntArray>PyList_GetItem( cell.lindices, src_index )
+
+                        for indexj in range( lindices.length ):
+                            j = lindices.data[indexj]
+
+                            xij2 = norm2( s_x.data[j]-xi.x,
+                                          s_y.data[j]-xi.y,
+                                          s_z.data[j]-xi.z )
+
+                            hj2 = radius_scale * s_h.data[j]
+                            hj2 *= hj2
+
+                            # select neighbor
+                            if ( (xij2 < hi2) or (xij2 < hj2) ):
+                                nbrs.append( j )
+    
+    def get_nearest_particles_cuda(self, int src_index, int dst_index,
+                                int dst_numPoints, UIntArray nbrs):
+        """Utility function to get near-neighbors for a particle.
+
+        Parameters:
+        -----------
+
+        src_index : int
+            Index of the source particle array in the particles list
+
+        dst_index : int
+            Index of the destination particle array in the particles list
+
+        d_idx : int (input)
+            Destination particle for which neighbors are sought.
+
+        nbrs : UIntArray (output)
+            Neighbors for the requested particle are stored here.
+
+        """
+        cdef dict cells = self.cells
+        cdef Cell cell
+
+        cdef NNPSParticleArrayWrapper src = self.pa_wrappers[ src_index ]
+        cdef NNPSParticleArrayWrapper dst = self.pa_wrappers[ dst_index ]
+
+        # Source particle arrays -> Device
+        s_x_gpu = gpuarray.to_gpu(src.x.get_npy_array().astype(np.float32))
+        s_y_gpu = gpuarray.to_gpu(src.y.get_npy_array().astype(np.float32))
+        s_z_gpu = gpuarray.to_gpu(src.z.get_npy_array().astype(np.float32))
+        s_h_gpu = gpuarray.to_gpu(src.h.get_npy_array().astype(np.float32))
+
+        # Destination particle arrays -> Device
+        d_x_gpu = gpuarray.to_gpu(dst.x.get_npy_array().astype(np.float32))
+        d_y_gpu = gpuarray.to_gpu(dst.y.get_npy_array().astype(np.float32))
+        d_z_gpu = gpuarray.to_gpu(dst.z.get_npy_array().astype(np.float32))
+        d_h_gpu = gpuarray.to_gpu(dst.h.get_npy_array().astype(np.float32))
+
+        cdef int ncx, ncy, ncz
+        cdef xmin = self.xmin
+        cdef max = self.xmax
+        cdef cell_size = self.cell_size
+
+        # calculate the number of cells.
+        ncx = <int>ceil( 1./cell_size*(xmax.data[0] - xmin.data[0]) )
+        ncy = <int>ceil( 1./cell_size*(xmax.data[1] - xmin.data[1]) )
+        ncz = <int>ceil( 1./cell_size*(xmax.data[2] - xmin.data[2]) )
+        
+        cdef int i, j
+        cdef int n_cells = self.ncells
+        cdef list cell_keys = self._cell_keys
+        cdef UIntArray cell_indices
+        cdef IntPoint cell_key
+        
+        cdef max_cell_pop = 0
+        
+        for i in range( n_cells ):
+            cell_key = <IntPoint>PyList_GetItem(cell_keys, i)
+            cell = <Cell>PyDict_GetItem(cells, cell_key)
+            cell_indices = <UIntArray>PyList_GetItem(cell.lindices, src_index)
+            if cell_indices.length > max_cell_pop:
+                max_cell_pop = cell_indices.length
+                
+        all_cell_indices = np.zeros((n_cells, max_cell_pop), dtype=numpy.int32)
+        cell_ids = -1*np.ones((ncx, ncy, ncz), dtype=numpy.int32)
+        for i in range( n_cells ):
+            cell_key = <IntPoint>PyList_GetItem(cell_keys, i)
+            cell = <Cell>PyDict_GetItem(cells, cell_key)
+            cell_indices = <UIntArray>PyList_GetItem(cell.lindices, src_index)
+            all_cell_indices[i][:cell_indices.length] = cell_indices
+            cell_ids[cell_key.x][cell_key.y][cell_key.z] = i
+        
+        all_cell_indices_gpu = gpuarray.to_gpu(all_cell_indices)
+        cell_ids_gpu = gpuarray.to_gpu(cell_ids)
+                
+        cdef double radius_scale = self.radius_scale
+        cdef double cell_size = self.cell_size
+        cdef UIntArray lindices
+        cdef size_t indexj
+        cdef ZOLTAN_ID_TYPE j
+        for i in range( dst_numPoints ):
+            cdef cPoint xi = cPoint_new(dst.x.data[i], dst.y.data[i], dst.z.data[i])
+            cdef cIntPoint _cid = find_cell_id( xi, cell_size )
+            cdef IntPoint cid = IntPoint_from_cIntPoint( _cid )
+            cdef IntPoint cellid = IntPoint(0, 0, 0)
+
+            cdef double xij2
+
+            cdef double hi2, hj2
+
+            hi2 = radius_scale * dst.h.data[i]
+            hi2 *= hi2
+
+            cdef int ierr
 
         # reset the nbr array length. This should avoid a realloc
         nbrs.reset()
