@@ -71,7 +71,7 @@ cdef class Cell:
     cdef int narrays                    # Number of particle arrays
     cdef public list lindices           # Local indices for particles
     cdef public list gindices           # Global indices for binned particles
-    cdef list nparticles                # Number of particles in the cell
+    cdef public list nparticles                # Number of particles in the cell
     cdef double cell_size               # bin size
     cdef public cPoint centroid         # Centroid computed from indices
     cdef cPoint boxmin                  # Bounding box min for the cell
@@ -141,7 +141,9 @@ cdef class NNPS:
     # unsigned int to follow the type of the local and global ids.
     cpdef get_nearest_particles(self, int src_index, int dst_index,
                                 size_t d_idx, UIntArray nbrs)
-
+    
+    #def dump(self, int a)
+    
     # Testing function for brute force neighbor search. The return
     # list is of the same type of the local and global ids (uint)
     cpdef brute_force_neighbors(self, int src_index, int dst_index,
