@@ -888,9 +888,48 @@ cdef class NNPS:
 
             # bin the particles
             self._bin( pa_index=i, indices=indices )
+    
+    def update_cuda(self):
+        """Update the local data after particles have moved.
 
+        For parallel runs, we want the NNPS to be independent of the
+        ParallelManager which is solely responsible for distributing
+        particles across available processors. We assume therefore
+        that after a parallel update, each processor has all the local
+        particle information it needs and this operation is carried
+        out locally.
+
+        For serial runs, this method should be called when the
+        particles have moved.
+
+        """
+        cdef int i, num_particles
+        cdef ParticleArray pa
+        cdef UIntArray indices
+        
+        cdef DomainManager domain = self.domain
+
+        # use cell sizes computed by the domain.
+        self.cell_size = domain.cell_size
+
+        # compute bounds and refresh the data structure
+        self._compute_bounds()
+        self._refresh()
+
+        # indices on which to bin. We bin all local particles
+        for i in range(self.narrays):
+            pa = self.particles[i]
+            num_particles = pa.get_number_of_particles()
+            indices = arange_uint(num_particles)
+
+            # bin the particles
+            self._bin( pa_index=i, indices=indices )
+    
     cdef _bin(self, int pa_index, UIntArray indices):
         raise NotImplementedError("NNPS :: _bin called")
+        
+    #cdef _bin_cuda(self, int pa_index, UIntArray indices):
+    #    raise NotImplementedError("NNPS :: _bin called")
 
     cpdef _refresh(self):
         raise NotImplementedError("NNPS :: _refresh called")
@@ -1105,10 +1144,59 @@ cdef class BoxSortNNPS(NNPS):
         # length for particle binning.
         self.domain.update()
         self.update()
-    
+
     mod = SourceModule("""
             #include <math.h>
             #include <stdio.h>
+            
+            __global__ void gencellpop(float* x, float* y, float* z, int* cellpop, int num_particles, float cell_size, int ncx, int ncy, int ocx, int ocy, int ocz)
+            {
+                const unsigned int BID = blockIdx.y * gridDim.x + blockIdx.x; // block ID
+                const unsigned int LID = threadIdx.x;  // local thread ID
+                const unsigned int TPB = blockDim.x; // threads per block
+                const unsigned int k = BID * TPB + LID;
+                
+                if(k < num_particles)
+                {
+                    float xi = x[k];
+                    float yi = y[k];
+                    float zi = z[k];
+                    int cellx = (int) floor(xi/cell_size) - ocx;
+                    int celly = (int) floor(yi/cell_size) - ocy;
+                    int cellz = (int) floor(zi/cell_size) - ocz;
+                    
+                    int celli = cellx + ncx*celly + ncx*ncy*cellz;
+                    //printf("%g, %g, %g, %d, %d, %d\\n", xi, yi, zi, cellx, celly, cellz);
+                    atomicAdd(&cellpop[celli], 1);
+                }
+            }
+            
+            __global__ void pop_cells(float* x, float* y, float* z, int* indices, int* cells, int* cellpop, int* cell_lock, int num_particles, float cell_size, int ncx, int ncy, int ocx, int ocy, int ocz, int max_cell_pop)
+            {
+                const unsigned int BID = blockIdx.y * gridDim.x + blockIdx.x; // block ID
+                const unsigned int LID = threadIdx.x;  // local thread ID
+                const unsigned int TPB = blockDim.x; // threads per block
+                const unsigned int k = BID * TPB + LID;
+                
+                if(k < num_particles)
+                {
+                    float xi = x[indices[k]];
+                    float yi = y[indices[k]];
+                    float zi = z[indices[k]];
+                    int cellx = (int) floor(xi/cell_size) - ocx;
+                    int celly = (int) floor(yi/cell_size) - ocy;
+                    int cellz = (int) floor(zi/cell_size) - ocz;
+                    
+                    int celli = cellx + ncx*celly + ncx*ncy*cellz;
+                    
+                    int i = atomicAdd(&cellpop[celli], 1);
+                    //printf("%d\\n", i);
+                    //printf("%d, %d, %d\\n", celli, cell_lock[celli], indices[k]);
+                    
+                    int cellpos = celli*max_cell_pop + i;
+                    cells[cellpos] = indices[k];
+                }
+            }
             
             __global__ void getnbrs(float* sx, float* sy, float* sz, float* sh, float* dx, float* dy, float* dz, float* dh, float cell_size, float radius_scale, int dst_numPoints, int max_cell_pop, int* cell_indices, int* cell_map, int ncx, int ncy, int ncz, int ocx, int ocy, int ocz, int* nbrs, int* nnbrs)
             {
@@ -1244,6 +1332,93 @@ cdef class BoxSortNNPS(NNPS):
 
         self.n_cells = <int>len(cells)
         self._cell_keys = cells.keys()
+    
+    def get_max_cell_pop(self, int pa_index, DMP):
+        
+        cdef NNPSParticleArrayWrapper pa_wrapper = self.pa_wrappers[ pa_index ]
+
+        #indices_gpu = gpuarray.to_gpu(indices.get_npy_array().astype(np.int32), allocator=DMP.allocate)
+        x_gpu = gpuarray.to_gpu(pa_wrapper.x.get_npy_array().astype(np.float32), allocator=DMP.allocate)
+        y_gpu = gpuarray.to_gpu(pa_wrapper.y.get_npy_array().astype(np.float32), allocator=DMP.allocate)
+        z_gpu = gpuarray.to_gpu(pa_wrapper.z.get_npy_array().astype(np.float32), allocator=DMP.allocate)
+        
+        #print pa_wrapper.x.get_npy_array()
+        
+        cdef int num_particles = pa_wrapper.x.length
+        
+        cdef int ncx, ncy, ncz, ocx, ocy, ocz
+        cdef DoubleArray xmin = self.xmin
+        cdef DoubleArray xmax = self.xmax
+        cdef double cell_size = self.cell_size
+
+        # calculate the number of cells.
+        ncx = <int>ceil( 1./cell_size*(xmax.data[0] - xmin.data[0]) )
+        ncy = <int>ceil( 1./cell_size*(xmax.data[1] - xmin.data[1]) )
+        ncz = <int>ceil( 1./cell_size*(xmax.data[2] - xmin.data[2]) )+1
+        
+        # calculate cell offsets
+        ocx = <int>floor(xmin.data[0]/cell_size)
+        ocy = <int>floor(xmin.data[1]/cell_size)
+        ocz = <int>floor(xmin.data[2]/cell_size)
+        
+        nc = np.array([ncx, ncy, ncz], dtype=np.int32)
+        oc = np.array([ocx, ocy, ocz], dtype=np.int32)
+        
+        cellpop_gpu = gpuarray.zeros((ncx, ncy, ncz), dtype=np.int32)
+        
+        cdef int MaxTperB = 1024
+        cdef int GB_X = 16
+        cdef int blocks = (num_particles + MaxTperB - 1) / MaxTperB
+        cdef int GB_Y = (blocks + GB_X - 1) / GB_X
+        
+        gencellpop = self.mod.get_function("gencellpop")
+        gencellpop(x_gpu, y_gpu, z_gpu, cellpop_gpu, np.int32(num_particles), np.float32(cell_size), np.int32(ncx), np.int32(ncy), np.int32(ocx), np.int32(ocy), np.int32(ocz), block=(MaxTperB, 1 , 1), grid=(GB_X, GB_Y, 1))
+        context.synchronize()
+        
+        #print cellpop_gpu.get()
+        
+        max_cell_pop = gpuarray.max(cellpop_gpu)
+        
+        #print max_cell_pop
+        return max_cell_pop, nc, num_particles
+        
+    def bin_cuda(self, int pa_index, UIntArray indices, cells_gpu, cellpop_gpu, max_cell_pop, num_particles, DMP):
+    
+        cdef NNPSParticleArrayWrapper pa_wrapper = self.pa_wrappers[ pa_index ]
+
+        indices_gpu = gpuarray.to_gpu(indices.get_npy_array().astype(np.int32), allocator=DMP.allocate)
+        x_gpu = gpuarray.to_gpu(pa_wrapper.x.get_npy_array().astype(np.float32), allocator=DMP.allocate)
+        y_gpu = gpuarray.to_gpu(pa_wrapper.y.get_npy_array().astype(np.float32), allocator=DMP.allocate)
+        z_gpu = gpuarray.to_gpu(pa_wrapper.z.get_npy_array().astype(np.float32), allocator=DMP.allocate)
+        
+        cdef int ncx, ncy, ncz, ocx, ocy, ocz
+        cdef DoubleArray xmin = self.xmin
+        cdef DoubleArray xmax = self.xmax
+        cdef double cell_size = self.cell_size
+
+        # calculate the number of cells.
+        ncx = <int>ceil( 1./cell_size*(xmax.data[0] - xmin.data[0]) )
+        ncy = <int>ceil( 1./cell_size*(xmax.data[1] - xmin.data[1]) )
+        ncz = <int>ceil( 1./cell_size*(xmax.data[2] - xmin.data[2]) )+1
+        
+        # calculate cell offsets
+        ocx = <int>floor(xmin.data[0]/cell_size)
+        ocy = <int>floor(xmin.data[1]/cell_size)
+        ocz = <int>floor(xmin.data[2]/cell_size)
+        
+        celllock_gpu = gpuarray.zeros((ncx, ncy, ncz), np.int32)
+        
+        cdef int MaxTperB = 1024
+        cdef int GB_X = 16
+        cdef int blocks = (num_particles + MaxTperB - 1) / MaxTperB
+        cdef int GB_Y = (blocks + GB_X - 1) / GB_X
+        
+        pop_cells = self.mod.get_function("pop_cells")
+        pop_cells(x_gpu, y_gpu, z_gpu, indices_gpu, cells_gpu, cellpop_gpu, celllock_gpu, np.int32(num_particles), np.float32(cell_size), np.int32(ncx), np.int32(ncy), np.int32(ocx), np.int32(ocy), np.int32(ocz), np.int32(max_cell_pop), block=(MaxTperB, 1 , 1), grid=(GB_X, GB_Y, 1))
+        context.synchronize()
+        
+        return cells_gpu.get()
+    
 
     ######################################################################
     # Neighbor location routines
@@ -1418,7 +1593,7 @@ cdef class BoxSortNNPS(NNPS):
         
     
     def get_nearest_particles_cuda(self, int src_index, int dst_index,
-                                int dst_numPoints, nbrs_gpu_ptr, nnbrs_gpu_ptr, int max_cell_pop, DMP):
+                                int dst_numPoints, nbrs_gpu_ptr, nnbrs_gpu_ptr, int max_cell_pop, cells_gpu, DMP):
         """
         Utility function to get near-neighbors for a particle.
 
@@ -1460,7 +1635,7 @@ cdef class BoxSortNNPS(NNPS):
         t1 = time.time() - t0
         print "Transfer time:", t1
         t0 = time.time()
-        cdef int ncx, ncy, ncz
+        cdef int ncx, ncy, ncz, ocx, ocy, ocz
         cdef DoubleArray xmin = self.xmin
         cdef DoubleArray xmax = self.xmax
         cdef double cell_size = self.cell_size

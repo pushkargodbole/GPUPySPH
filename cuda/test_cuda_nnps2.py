@@ -17,7 +17,7 @@ This tutorial illustrates the following:
 # PySPH imports
 from pyzoltan.core.carray import UIntArray
 from pysph.base import utils
-from pysph.base.nnps import DomainManager, BoxSortNNPS, Cell
+from pysph.base.nnps import DomainManager, BoxSortNNPS, Cell, arange_uint
 from pysph.base.kernels import CubicSpline, Gaussian, QuinticSpline, WendlandQuintic
 from pysph.tools.uniform_distribution import uniform_distribution_cubic2D, \
     uniform_distribution_hcp2D, get_number_density_hcp
@@ -25,6 +25,8 @@ from pysph.tools.uniform_distribution import uniform_distribution_cubic2D, \
 # NumPy
 import numpy
 import numpy as np
+
+from math import ceil, floor
 
 # Python timer
 from time import time
@@ -41,9 +43,20 @@ from pycuda.tools import DeviceMemoryPool
 dx = 0.1; dxb2 = 0.5 * dx
 h0 = 2.*dx
 max = 1.
+min = 0.
+
+is2D = True
+
+if is2D:
+    maxz = 0.
+    minz = 0.
+else:
+    maxz = max
+    minz = min
+
 # Uniform lattice distribution of particles
 x, y, dx, dy, xmin, xmax, ymin, ymax = uniform_distribution_cubic2D(
-    dx, xmin=0.0, xmax=max, ymin=0.0, ymax=max)
+    dx, xmin=min, xmax=max, ymin=min, ymax=max)
 
 # Uniform hexagonal close packing arrangement of particles
 #x, y, dx, dy, xmin, xmax, ymin, ymax = uniform_distribution_hcp2D(
@@ -74,29 +87,37 @@ pa = utils.get_particle_array(x=x,y=y,h=h,m=m,wij=wij)
 
 # the simulation domain used to request periodicity
 domain = DomainManager(
-    xmin=0., xmax=max, ymin=0., ymax=max,periodic_in_x=True, periodic_in_y=True)
+    xmin=min, xmax=max, ymin=min, ymax=max,periodic_in_x=True, periodic_in_y=True)
+
+
 
 # NNPS object for nearest neighbor queries
 nps = BoxSortNNPS(dim=2, particles=[pa,], radius_scale=k.radius_scale, domain=domain)
+cell_size = nps.cell_size
+print cell_size
 
-cells = nps.cells
-max_cell_pop = 0
+DMP = DeviceMemoryPool()
+max_cell_pop_gpu, nc, num_particles = nps.get_max_cell_pop(0, DMP)
 
-for cellkey in cells.keys():
-    print cellkey, cells[cellkey].nparticles[0]
-    print cells[cellkey].lindices[0].get_npy_array()
-    if cells[cellkey].nparticles[0] > max_cell_pop:
-        max_cell_pop = cells[cellkey].nparticles[0]
+max_cell_pop = max_cell_pop_gpu.get()
 
 
-print len(cells)
-print nps.cell_size
-print pa.num_real_particles
+cells_gpu = gpuarray.zeros((nc[0]*nc[1]*nc[2], int(max_cell_pop)), dtype=np.int32)-1
+cellpop_gpu = gpuarray.zeros((nc[0], nc[1], nc[2]), dtype=np.int32)
+#cells_gpu_ptr = np.intp(cells_gpu.base.get_device_pointer())
 
-print max_cell_pop
+indices = arange_uint(num_particles)
+
+cells = nps.bin_cuda(0, indices, cells_gpu, cellpop_gpu, max_cell_pop, num_particles, DMP)
+
+print cells.shape
+
+print cells[0]
+print cells[1]
+
 """
 t0 = time()
-DMP = DeviceMemoryPool()
+
 print pa.num_real_particles*27*max_cell_pop
 nbrs_gpu = cuda.pagelocked_empty(shape=(pa.num_real_particles, 27*max_cell_pop), dtype=np.int32)
 nbrs_gpu_ptr = np.intp(nbrs_gpu.base.get_device_pointer())
