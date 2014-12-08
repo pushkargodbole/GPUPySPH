@@ -40,7 +40,7 @@ from pycuda.compiler import SourceModule
 from pycuda.tools import DeviceMemoryPool
 
 # particle spacings
-dx = 0.1; dxb2 = 0.5 * dx
+dx = 0.001; dxb2 = 0.5 * dx
 h0 = 2.*dx
 max = 1.
 min = 0.
@@ -87,67 +87,113 @@ pa = utils.get_particle_array(x=x,y=y,h=h,m=m,wij=wij)
 
 # the simulation domain used to request periodicity
 domain = DomainManager(
-    xmin=min, xmax=max, ymin=min, ymax=max,periodic_in_x=True, periodic_in_y=True)
+    xmin=min, xmax=max, ymin=min, ymax=max,periodic_in_x=False, periodic_in_y=False)
 
-
+print "NumPa:", pa.num_real_particles
 
 # NNPS object for nearest neighbor queries
 nps = BoxSortNNPS(dim=2, particles=[pa,], radius_scale=k.radius_scale, domain=domain)
-cell_size = nps.cell_size
-print cell_size
-
+#nps.bin()
 DMP = DeviceMemoryPool()
-max_cell_pop_gpu, nc, num_particles = nps.get_max_cell_pop(0, DMP)
+"""
+cells = nps.cells
 
+max_cell_pop = 0
+for cellkey in cells.keys():
+        #print cellkey, cells[cellkey].nparticles[0]
+        #print cells[cellkey].lindices[0].get_npy_array()
+        if cells[cellkey].nparticles[0] > max_cell_pop:
+            max_cell_pop = cells[cellkey].nparticles[0]
+"""
+
+max_cell_pop_gpu, nc, num_particles = nps.get_max_cell_pop(0, DMP)
 max_cell_pop = max_cell_pop_gpu.get()
 
-
-cells_gpu = gpuarray.zeros((nc[0]*nc[1]*nc[2], int(max_cell_pop)), dtype=np.int32)-1
-cellpop_gpu = gpuarray.zeros((nc[0], nc[1], nc[2]), dtype=np.int32)
-#cells_gpu_ptr = np.intp(cells_gpu.base.get_device_pointer())
-
-indices = arange_uint(num_particles)
-
-cells = nps.bin_cuda(0, indices, cells_gpu, cellpop_gpu, max_cell_pop, num_particles, DMP)
-
-print cells.shape
-
-print cells[0]
-print cells[1]
-
-"""
-t0 = time()
-
-print pa.num_real_particles*27*max_cell_pop
 nbrs_gpu = cuda.pagelocked_empty(shape=(pa.num_real_particles, 27*max_cell_pop), dtype=np.int32)
 nbrs_gpu_ptr = np.intp(nbrs_gpu.base.get_device_pointer())
 
 nnbrs_gpu = cuda.pagelocked_empty(shape=(pa.num_real_particles), dtype=np.int32)
 nnbrs_gpu_ptr = np.intp(nnbrs_gpu.base.get_device_pointer())
-print "Alloc time:", time()-t0
 
-# container for neighbors
-print "Cuda Start"
-t1 = time()
-nps.get_nearest_particles_cuda(0, 0, pa.num_real_particles, nbrs_gpu_ptr, nnbrs_gpu_ptr, max_cell_pop, DMP)
-t2 = time()-t1
-print "Cuda End"
+
+cells_gpu = gpuarray.zeros((nc[0]*nc[1]*nc[2], int(max_cell_pop)), dtype=np.int32)-1
+#cellpop_gpu = gpuarray.zeros((nc[0], nc[1], nc[2]), dtype=np.int32)
+
+indices = arange_uint(num_particles)
+
+iters = 100
 print "NumPa:", pa.num_real_particles
-nbrs = UIntArray()
-print "Basic Start"
-t1 = time()
-for i in range(pa.num_real_particles):
-    nps.get_nearest_particles(0, 0, i, nbrs)
-    if i == pa.num_real_particles-1:
-        print len(nbrs), nbrs.get_npy_array()
-        print nnbrs_gpu[pa.num_real_particles-1], nbrs_gpu[pa.num_real_particles-1][:nnbrs_gpu[pa.num_real_particles-1]]
-    
-t3 = time()-t1
-print "Basic End"    
-print "****************************************"
-print "Cuda Time =", t2
-print "Basic Time =", t3
-print nnbrs_gpu
-nbrs_gpu.base.free()
-nnbrs_gpu.base.free()
-"""
+bint = 0.
+npst = 0.
+for iter in range(iters):
+    #bintime = nps.bin()
+    """
+    #print 'Bin time:', bintime
+    #cell_size = nps.cell_size
+    #print cell_size
+
+    cells = nps.cells
+    #print len(cells)
+    max_cell_pop = 0
+    t0 = time()
+    for cellkey in cells.keys():
+        #print cellkey, cells[cellkey].nparticles[0]
+        #print cells[cellkey].lindices[0].get_npy_array()
+        if cells[cellkey].nparticles[0] > max_cell_pop:
+            max_cell_pop = cells[cellkey].nparticles[0]
+    #print max_cell_pop
+    bintime += time() - t0
+    """
+    t0 = time()
+    max_cell_pop_gpu, nc, num_particles = nps.get_max_cell_pop(0, DMP)
+
+    max_cell_pop = max_cell_pop_gpu.get()
+    #print max_cell_pop
+
+    #print nc
+    #cells_gpu_ptr = np.intp(cells_gpu.base.get_device_pointer())
+
+    cellpop_gpu = gpuarray.zeros((nc[0], nc[1], nc[2]), dtype=np.int32)
+    nps.bin_cuda(0, indices, cells_gpu, cellpop_gpu, max_cell_pop, num_particles, DMP)
+    bintime = time() - t0
+    #print cellpop_gpu.get()
+
+    #print cells.shape
+
+    #print cells[0]
+    #print cells[1]
+
+    #t0 = time()
+
+    #print pa.num_real_particles*27*max_cell_pop
+    #print "Alloc time:", time()-t0
+
+    # container for neighbors
+    #print "Cuda Start"
+    t1 = time()
+    #nps.get_nearest_particles_cuda(0, 0, pa.num_real_particles, max_cell_pop)
+    nps.get_nearest_particles_cuda2(0, 0, pa.num_real_particles, nbrs_gpu_ptr, nnbrs_gpu_ptr, max_cell_pop, cells_gpu, cellpop_gpu, DMP)
+    t2 = time()-t1
+    #print "Cuda End"
+    #print "Basic Start"
+    """
+    t1 = time()
+    nbrs = UIntArray()
+    for i in range(pa.num_real_particles):
+        nps.get_nearest_particles(0, 0, i, nbrs)
+        #print len(nbrs), nbrs.get_npy_array()
+        #print nnbrs_gpu[i], nbrs_gpu[i][:nnbrs_gpu[i]]   
+    t3 = time()-t1
+    """
+    #print "Basic End"  
+     
+    #print "****************************************"
+    #print "Cuda Time =", t2
+    #print "Basic Time =", t3
+    bint += bintime
+    npst += t2
+    print iter+1, bintime, t2, round(bint, 4), round(npst, 4)
+    #print nnbrs_gpu
+    #nbrs_gpu.base.free()
+    #nnbrs_gpu.base.free()
+

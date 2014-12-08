@@ -16,12 +16,8 @@ cimport cython
 import pycuda.gpuarray as gpuarray
 import pycuda.driver as cuda
 import pycuda.autoinit
-from pycuda.autoinit import context
 from pycuda.compiler import SourceModule
-#from pycuda.tools import PageLockedMemoryPool
-from pycuda.tools import DeviceMemoryPool
-
-import time
+from pycuda.reduction import ReductionKernel
 
 cdef extern from 'math.h':
     int abs(int)
@@ -881,59 +877,6 @@ cdef class NNPS:
         self._refresh()
 
         # indices on which to bin. We bin all local particles
-        """
-        for i in range(self.narrays):
-            pa = self.particles[i]
-            num_particles = pa.get_number_of_particles()
-            indices = arange_uint(num_particles)
-
-            # bin the particles
-            
-            self._bin( pa_index=i, indices=indices )
-        """
-    
-    def bin(self):
-        t0 = time.time()
-        self._compute_bounds()
-        self._refresh()
-        for i in range(self.narrays):
-            pa = self.particles[i]
-            num_particles = pa.get_number_of_particles()
-            indices = arange_uint(num_particles)
-
-            # bin the particles
-            
-            self._bin( pa_index=i, indices=indices )
-        return time.time() - t0
-        
-    def update_cuda(self):
-        """Update the local data after particles have moved.
-
-        For parallel runs, we want the NNPS to be independent of the
-        ParallelManager which is solely responsible for distributing
-        particles across available processors. We assume therefore
-        that after a parallel update, each processor has all the local
-        particle information it needs and this operation is carried
-        out locally.
-
-        For serial runs, this method should be called when the
-        particles have moved.
-
-        """
-        cdef int i, num_particles
-        cdef ParticleArray pa
-        cdef UIntArray indices
-        
-        cdef DomainManager domain = self.domain
-
-        # use cell sizes computed by the domain.
-        self.cell_size = domain.cell_size
-
-        # compute bounds and refresh the data structure
-        self._compute_bounds()
-        self._refresh()
-
-        # indices on which to bin. We bin all local particles
         for i in range(self.narrays):
             pa = self.particles[i]
             num_particles = pa.get_number_of_particles()
@@ -941,12 +884,9 @@ cdef class NNPS:
 
             # bin the particles
             self._bin( pa_index=i, indices=indices )
-    
+
     cdef _bin(self, int pa_index, UIntArray indices):
         raise NotImplementedError("NNPS :: _bin called")
-        
-    #cdef _bin_cuda(self, int pa_index, UIntArray indices):
-    #    raise NotImplementedError("NNPS :: _bin called")
 
     cpdef _refresh(self):
         raise NotImplementedError("NNPS :: _refresh called")
@@ -1162,204 +1102,6 @@ cdef class BoxSortNNPS(NNPS):
         self.domain.update()
         self.update()
 
-    mod1 = SourceModule("""
-            #include <math.h>
-            #include <stdio.h>
-            
-            __global__ void gencellpop(float* x, float* y, float* z, int* cellpop, int num_particles, float cell_size, int ncx, int ncy, int ocx, int ocy, int ocz)
-            {
-                const unsigned int BID = blockIdx.y * gridDim.x + blockIdx.x; // block ID
-                const unsigned int LID = threadIdx.x;  // local thread ID
-                const unsigned int TPB = blockDim.x; // threads per block
-                const unsigned int k = BID * TPB + LID;
-                
-                if(k < num_particles)
-                {
-                    float xi = x[k];
-                    float yi = y[k];
-                    float zi = z[k];
-                    int cellx = (int) floor(xi/cell_size) - ocx;
-                    int celly = (int) floor(yi/cell_size) - ocy;
-                    int cellz = (int) floor(zi/cell_size) - ocz;
-                    
-                    int celli = cellx + ncx*celly + ncx*ncy*cellz;
-                    //printf("%g, %g, %g, %d, %d, %d\\n", xi, yi, zi, cellx, celly, cellz);
-                    atomicAdd(&cellpop[celli], 1);
-                }
-            }
-            
-            __global__ void pop_cells(float* x, float* y, float* z, int* indices, int* cells, int* cellpop, int num_particles, float cell_size, int ncx, int ncy, int ocx, int ocy, int ocz, int max_cell_pop)
-            {
-                const unsigned int BID = blockIdx.y * gridDim.x + blockIdx.x; // block ID
-                const unsigned int LID = threadIdx.x;  // local thread ID
-                const unsigned int TPB = blockDim.x; // threads per block
-                const unsigned int k = BID * TPB + LID;
-                
-                if(k < num_particles)
-                {
-                    float xi = x[indices[k]];
-                    float yi = y[indices[k]];
-                    float zi = z[indices[k]];
-                    int cellx = (int) floor(xi/cell_size) - ocx;
-                    int celly = (int) floor(yi/cell_size) - ocy;
-                    int cellz = (int) floor(zi/cell_size) - ocz;
-                    
-                    int celli = cellx + ncx*celly + ncx*ncy*cellz;
-                    
-                    int i = atomicAdd(&cellpop[celli], 1);
-                    //printf("%d\\n", i);
-                    //printf("%d, %d, %d\\n", celli, cell_lock[celli], indices[k]);
-                    
-                    int cellpos = celli*max_cell_pop + i;
-                    cells[cellpos] = indices[k];
-                }
-            }
-            
-    """, options=["--ptxas-options=-v", "--maxrregcount=32"])
-    
-    mod2 = SourceModule("""
-            #include <stdio.h>
-            #include <math.h>
-            
-            __global__ void getnbrs(float* sx, float* sy, float* sz, float* sh, float* dx, float* dy, float* dz, float* dh, float cell_size, float radius_scale, int dst_numPoints, int max_cell_pop, int* cell_indices, int* cell_map, int ncx, int ncy, int ncz, int ocx, int ocy, int ocz, int* nbrs, int* nnbrs)
-            {
-                const unsigned int BID = blockIdx.y * gridDim.x + blockIdx.x; // block ID
-                const unsigned int LID = threadIdx.x;  // local thread ID
-                const unsigned int TPB = blockDim.x; // threads per block
-                const unsigned int k = BID * TPB + LID;
-                //printf("%d, %d, %d, %d\\n", blockIdx.x, blockIdx.y, threadIdx.x, k);
-                if(k < dst_numPoints)
-                {
-                    float dxi = dx[k];
-                    float dyi = dy[k];
-                    float dzi = dz[k];
-                    float dhi = dh[k];
-                    int dcellx = (int) floor(dxi/cell_size);
-                    int dcelly = (int) floor(dyi/cell_size);
-                    int dcellz = (int) floor(dzi/cell_size);
-                    int n = 0;
-                    int scellx, scelly, scellz;
-                    for(int z = -1; z < 2; z++)
-                    {
-                        scellz = dcellz + z - ocz;
-                        if(scellz >= 0 && scellz < ncz)
-                        {
-                            for(int y = -1; y < 2; y++)
-                            {
-                                scelly = dcelly + y - ocy;
-                                if(scelly >= 0 && scelly < ncy)
-                                {
-                                    for(int x = -1; x < 2; x++)
-                                    {
-                                        scellx = dcellx + x - ocx;
-                                        if(scellx >= 0 && scellx < ncx)
-                                        { 
-                                            int scelli = scellx + ncx*scelly + ncx*ncy*scellz;
-                                            if(cell_map[scelli] != -1)
-                                            {
-                                                //if(k==0) printf("%d, %d, %d, %d, %d, %d\\n", dcellx, dcelly, dcellz, scellx, scelly, scellz);
-                                                
-                                                for(int i = 0; i < max_cell_pop; i++)
-                                                {
-                                                    int spi = i + cell_map[scelli]*max_cell_pop;
-                                                    
-                                                    if(cell_indices[spi] != -1)
-                                                    {
-                                                        float sxi = sx[cell_indices[spi]];
-                                                        float syi = sy[cell_indices[spi]];
-                                                        float szi = sz[cell_indices[spi]];
-                                                        float shi = sh[cell_indices[spi]];
-                                                        
-                                                        float dist = sqrt(pow((dxi-sxi), 2) + pow((dyi-syi), 2)+pow((dzi-szi), 2));
-                                                        float dr = radius_scale*dhi;
-                                                        float sr = radius_scale*shi;
-                                                        if(dist <= dr || dist <= sr)
-                                                        {
-                                                            nbrs[k*27*max_cell_pop+n] = cell_indices[spi];
-                                                            n++;
-                                                            //printf("n = %d\\n", n);
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                                
-                    }
-                    nnbrs[k] = n;
-                }
-            }
-            
-            __global__ void getnbrs2(float* sx, float* sy, float* sz, float* sh, float* dx, float* dy, float* dz, float* dh, float cell_size, float radius_scale, int* cells, int* cellpop, int* data, int* nbrs, int* nnbrs)
-            {
-                const unsigned int BID = blockIdx.y * gridDim.x + blockIdx.x; // block ID
-                const unsigned int LID = threadIdx.x;  // local thread ID
-                const unsigned int TPB = blockDim.x; // threads per block
-                const unsigned int k = BID * TPB + LID;
-                //printf("%d, %d, %d, %d\\n", blockIdx.x, blockIdx.y, threadIdx.x, k);
-                if(k < data[6])
-                {
-                    float dxi = dx[k];
-                    float dyi = dy[k];
-                    float dzi = dz[k];
-                    float dhi = dh[k];
-                    int dcellx = (int) floor(dxi/cell_size);
-                    int dcelly = (int) floor(dyi/cell_size);
-                    int dcellz = (int) floor(dzi/cell_size);
-                    int n = 0;
-                    int scellx, scelly, scellz;
-                    for(int z = -1; z < 2; z++)
-                    {
-                        scellz = dcellz + z - data[5];
-                        if(scellz >= 0 && scellz < data[2])
-                        {
-                            for(int y = -1; y < 2; y++)
-                            {
-                                scelly = dcelly + y - data[4];
-                                if(scelly >= 0 && scelly < data[1])
-                                {
-                                    for(int x = -1; x < 2; x++)
-                                    {
-                                        scellx = dcellx + x - data[3];
-                                        if(scellx >= 0 && scellx < data[0])
-                                        {
-                                            int scelli = scellx + data[0]*scelly + data[0]*data[1]*scellz;
-                                            
-                                            for(int i = 0; i < cellpop[scelli]; i++)
-                                            {
-                                                int spi = i + scelli*data[7];
-                                                
-                                                float sxi = sx[cells[spi]];
-                                                float syi = sy[cells[spi]];
-                                                float szi = sz[cells[spi]];
-                                                float shi = sh[cells[spi]];
-                                                
-                                                float dist = sqrt(pow((dxi-sxi), 2) + pow((dyi-syi), 2)+pow((dzi-szi), 2));
-                                                float dr = radius_scale*dhi;
-                                                float sr = radius_scale*shi;
-                                                if(dist <= dr || dist <= sr)
-                                                {
-                                                    nbrs[k*27*data[7]+n] = cells[spi];
-                                                    n++;
-                                                    //printf("n = %d\\n", n);
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                                
-                    }
-                    nnbrs[k] = n;
-                    //printf("** %d\\n", p);
-                }
-            }
-    """, options=["--ptxas-options=-v", "--maxrregcount=32"]) 
-    
     cpdef _refresh(self):
         "Clear the cells dict"
         cdef dict cells = self.cells
@@ -1415,99 +1157,10 @@ cdef class BoxSortNNPS(NNPS):
             lindices = <UIntArray>PyList_GetItem( cell.lindices, pa_index )
 
             lindices.append( <ZOLTAN_ID_TYPE> i )
-            cell.nparticles[pa_index] += 1
             #gindices.append( gid.data[i] )
 
         self.n_cells = <int>len(cells)
         self._cell_keys = cells.keys()
-    
-    def get_max_cell_pop(self, int pa_index, DMP):
-        
-        cdef NNPSParticleArrayWrapper pa_wrapper = self.pa_wrappers[ pa_index ]
-
-        #indices_gpu = gpuarray.to_gpu(indices.get_npy_array().astype(np.int32), allocator=DMP.allocate)
-        x_gpu = gpuarray.to_gpu(pa_wrapper.x.get_npy_array().astype(np.float32), allocator=DMP.allocate)
-        y_gpu = gpuarray.to_gpu(pa_wrapper.y.get_npy_array().astype(np.float32), allocator=DMP.allocate)
-        z_gpu = gpuarray.to_gpu(pa_wrapper.z.get_npy_array().astype(np.float32), allocator=DMP.allocate)
-        
-        #print pa_wrapper.x.get_npy_array()
-        
-        cdef int num_particles = pa_wrapper.x.length
-        
-        cdef int ncx, ncy, ncz, ocx, ocy, ocz
-        cdef DoubleArray xmin = self.xmin
-        cdef DoubleArray xmax = self.xmax
-        cdef double cell_size = self.cell_size
-
-        # calculate the number of cells.
-        ncx = <int>ceil( 1./cell_size*(xmax.data[0] - xmin.data[0]) )+1
-        ncy = <int>ceil( 1./cell_size*(xmax.data[1] - xmin.data[1]) )+1
-        ncz = <int>ceil( 1./cell_size*(xmax.data[2] - xmin.data[2]) )+1
-        
-        # calculate cell offsets
-        ocx = <int>floor(xmin.data[0]/cell_size)
-        ocy = <int>floor(xmin.data[1]/cell_size)
-        ocz = <int>floor(xmin.data[2]/cell_size)
-        
-        nc = np.array([ncx, ncy, ncz], dtype=np.int32)
-        oc = np.array([ocx, ocy, ocz], dtype=np.int32)
-        
-        cellpop_gpu = gpuarray.zeros((ncx, ncy, ncz), dtype=np.int32)
-        
-        cdef int MaxTperB = 1024
-        cdef int GB_X = 16
-        cdef int blocks = (num_particles + MaxTperB - 1) / MaxTperB
-        cdef int GB_Y = (blocks + GB_X - 1) / GB_X
-        
-        gencellpop = self.mod1.get_function("gencellpop")
-        gencellpop(x_gpu, y_gpu, z_gpu, cellpop_gpu, np.int32(num_particles), np.float32(cell_size), np.int32(ncx), np.int32(ncy), np.int32(ocx), np.int32(ocy), np.int32(ocz), block=(MaxTperB, 1 , 1), grid=(GB_X, GB_Y, 1))
-        context.synchronize()
-        
-        #print cellpop_gpu.get()
-        
-        max_cell_pop = gpuarray.max(cellpop_gpu)
-        
-        #print max_cell_pop
-        return max_cell_pop, nc, num_particles
-        
-    def bin_cuda(self, int pa_index, UIntArray indices, cells_gpu, cellpop_gpu, max_cell_pop, num_particles, DMP):
-    
-        cdef NNPSParticleArrayWrapper pa_wrapper = self.pa_wrappers[ pa_index ]
-
-        indices_gpu = gpuarray.to_gpu(indices.get_npy_array().astype(np.int32), allocator=DMP.allocate)
-        x_gpu = gpuarray.to_gpu(pa_wrapper.x.get_npy_array().astype(np.float32), allocator=DMP.allocate)
-        y_gpu = gpuarray.to_gpu(pa_wrapper.y.get_npy_array().astype(np.float32), allocator=DMP.allocate)
-        z_gpu = gpuarray.to_gpu(pa_wrapper.z.get_npy_array().astype(np.float32), allocator=DMP.allocate)
-        
-        cdef int ncx, ncy, ncz, ocx, ocy, ocz
-        cdef DoubleArray xmin = self.xmin
-        cdef DoubleArray xmax = self.xmax
-        cdef double cell_size = self.cell_size
-
-        # calculate the number of cells.
-        ncx = <int>ceil( 1./cell_size*(xmax.data[0] - xmin.data[0]) )+1
-        ncy = <int>ceil( 1./cell_size*(xmax.data[1] - xmin.data[1]) )+1
-        ncz = <int>ceil( 1./cell_size*(xmax.data[2] - xmin.data[2]) )+1
-        
-        # calculate cell offsets
-        ocx = <int>floor(xmin.data[0]/cell_size)
-        ocy = <int>floor(xmin.data[1]/cell_size)
-        ocz = <int>floor(xmin.data[2]/cell_size)
-        
-        #celllock_gpu = gpuarray.zeros((ncx, ncy, ncz), np.int32)
-        
-        cdef int MaxTperB = 1024
-        cdef int GB_X = 16
-        cdef int blocks = (num_particles + MaxTperB - 1) / MaxTperB
-        cdef int GB_Y = (blocks + GB_X - 1) / GB_X
-        
-        pop_cells = self.mod1.get_function("pop_cells")
-        pop_cells(x_gpu, y_gpu, z_gpu, indices_gpu, cells_gpu, cellpop_gpu, np.int32(num_particles), np.float32(cell_size), np.int32(ncx), np.int32(ncy), np.int32(ocx), np.int32(ocy), np.int32(ocz), np.int32(max_cell_pop), block=(MaxTperB, 1 , 1), grid=(GB_X, GB_Y, 1))
-        context.synchronize()
-        
-        #print '@', cells_gpu.get()
-        #return cells_gpu.get()
-    
 
     ######################################################################
     # Neighbor location routines
@@ -1635,7 +1288,6 @@ cdef class BoxSortNNPS(NNPS):
         cdef cPoint xi = cPoint_new(d_x.data[d_idx], d_y.data[d_idx], d_z.data[d_idx])
         cdef cIntPoint _cid = find_cell_id( xi, cell_size )
         cdef IntPoint cid = IntPoint_from_cIntPoint( _cid )
-        #print cid.x, cid.y, cid.z
         cdef IntPoint cellid = IntPoint(0, 0, 0)
 
         cdef double xij2
@@ -1682,9 +1334,7 @@ cdef class BoxSortNNPS(NNPS):
         
     
     def get_nearest_particles_cuda(self, int src_index, int dst_index,
-                                int dst_numPoints,
-                                #nbrs_gpu_ptr, nnbrs_gpu_ptr,
-                                int max_cell_pop):
+                                int dst_numPoints):
         """
         Utility function to get near-neighbors for a particle.
 
@@ -1703,30 +1353,27 @@ cdef class BoxSortNNPS(NNPS):
         nbrs : UIntArray (output)
             Neighbors for the requested particle are stored here.
         """
-        #tt = time.time()
+        
         cdef dict cells = self.cells
         cdef Cell cell
-        #t0 = time.time()
+
         cdef NNPSParticleArrayWrapper src = self.pa_wrappers[ src_index ]
         cdef NNPSParticleArrayWrapper dst = self.pa_wrappers[ dst_index ]
-        #t01 = time.time() - t0
-        #print "Init time:", t01
-        #t0 = time.time()
+
         # Source particle arrays -> Device
-        s_x_gpu = gpuarray.to_gpu(src.x.get_npy_array().astype(np.float32))#, allocator=DMP.allocate)
-        s_y_gpu = gpuarray.to_gpu(src.y.get_npy_array().astype(np.float32))#, allocator=DMP.allocate)
-        s_z_gpu = gpuarray.to_gpu(src.z.get_npy_array().astype(np.float32))#, allocator=DMP.allocate)
-        s_h_gpu = gpuarray.to_gpu(src.h.get_npy_array().astype(np.float32))#, allocator=DMP.allocate)
+        s_x_gpu = gpuarray.to_gpu(src.x.get_npy_array().astype(np.float32))
+        s_y_gpu = gpuarray.to_gpu(src.y.get_npy_array().astype(np.float32))
+        s_z_gpu = gpuarray.to_gpu(src.z.get_npy_array().astype(np.float32))
+        s_h_gpu = gpuarray.to_gpu(src.h.get_npy_array().astype(np.float32))
 
         # Destination particle arrays -> Device
-        d_x_gpu = gpuarray.to_gpu(dst.x.get_npy_array().astype(np.float32))#, allocator=DMP.allocate)
-        d_y_gpu = gpuarray.to_gpu(dst.y.get_npy_array().astype(np.float32))#, allocator=DMP.allocate)
-        d_z_gpu = gpuarray.to_gpu(dst.z.get_npy_array().astype(np.float32))#, allocator=DMP.allocate)
-        d_h_gpu = gpuarray.to_gpu(dst.h.get_npy_array().astype(np.float32))#, allocator=DMP.allocate)
-        #t1 = time.time() - t0
-        #print "Transfer time:", t1
-        #t0 = time.time()
-        cdef int ncx, ncy, ncz, ocx, ocy, ocz
+        d_x_gpu = gpuarray.to_gpu(dst.x.get_npy_array().astype(np.float32))
+        d_y_gpu = gpuarray.to_gpu(dst.y.get_npy_array().astype(np.float32))
+        d_z_gpu = gpuarray.to_gpu(dst.z.get_npy_array().astype(np.float32))
+        d_h_gpu = gpuarray.to_gpu(dst.h.get_npy_array().astype(np.float32))
+        
+        
+        cdef int ncx, ncy, ncz
         cdef DoubleArray xmin = self.xmin
         cdef DoubleArray xmax = self.xmax
         cdef double cell_size = self.cell_size
@@ -1736,143 +1383,202 @@ cdef class BoxSortNNPS(NNPS):
         ncy = <int>ceil( 1./cell_size*(xmax.data[1] - xmin.data[1]) ) + 1
         ncz = <int>ceil( 1./cell_size*(xmax.data[2] - xmin.data[2]) ) + 1
         
-        # calculate cell offsets
-        ocx = <int>floor(xmin.data[0]/cell_size)
-        ocy = <int>floor(xmin.data[1]/cell_size)
-        ocz = <int>floor(xmin.data[2]/cell_size)
-        
         cdef int i, j
         cdef int n_cells = self.n_cells
         cdef list cell_keys = self._cell_keys
         cdef double radius_scale = self.radius_scale
         cdef UIntArray cell_indices
         cdef IntPoint cell_key
-        #print n_cells, max_cell_pop
-        all_cell_indices = -1*np.ones((n_cells, max_cell_pop), dtype=np.int32)
-        cell_map = -1*np.ones((ncx, ncy, ncz), dtype=np.int32)
-        #print "n_cells =", n_cells
-        #print "max_cell_pop =", max_cell_pop
+        
+        cdef max_cell_pop = 0
+        
         for i in range( n_cells ):
             cell_key = <IntPoint>PyList_GetItem(cell_keys, i)
-            #print cell_key
             cell = <Cell>PyDict_GetItem(cells, cell_key)
             cell_indices = <UIntArray>PyList_GetItem(cell.lindices, src_index)
-            #print cell_indices.get_npy_array()
+            if cell_indices.length > max_cell_pop:
+                max_cell_pop = cell_indices.length
+                
+        all_cell_indices = np.empty((n_cells, max_cell_pop), dtype=np.int32)
+        cell_map = -1*np.ones((ncx, ncy, ncz), dtype=np.int32)
+        print "n_cells =", n_cells
+        print "max_cell_pop =", max_cell_pop
+        for i in range( n_cells ):
+            cell_key = <IntPoint>PyList_GetItem(cell_keys, i)
+            cell = <Cell>PyDict_GetItem(cells, cell_key)
+            cell_indices = <UIntArray>PyList_GetItem(cell.lindices, src_index)
+            #print cell_indices.length
             all_cell_indices[i][:cell_indices.length] = cell_indices
-            cell_map[cell_key.x-ocx][cell_key.y-ocy][cell_key.z-ocz] = i
+            cell_map[cell_key.x][cell_key.y][cell_key.z] = i
+        
+        all_cell_indices_gpu = gpuarray.to_gpu(all_cell_indices)
+        cell_map_gpu = gpuarray.to_gpu(cell_map)
+        
+        # 27 is the number of neighboring cells (9 for 2D and 27 for 3D)
+        cdef unsigned int len_is_nbr = dst_numPoints*27*max_cell_pop
+        is_nbr_gpu = gpuarray.zeros((len_is_nbr), dtype=np.int32)
+        
+        mod = SourceModule("""
+            #include <math.h>
             
-        #print '#', all_cell_indices
-        #t2 = time.time() - t0
-        #print "Shaping time:", t2
-        #print '$', all_cell_indices
-        #t0 = time.time()
-        all_cell_indices_gpu = gpuarray.to_gpu(all_cell_indices)#, allocator=DMP.allocate)
-        cell_map_gpu = gpuarray.to_gpu(cell_map)#, allocator=DMP.allocate)
-        
-        nbrs_gpu = gpuarray.empty(shape=(dst_numPoints, 27*max_cell_pop), dtype=np.int32)
-
-        nnbrs_gpu = gpuarray.empty(shape=(dst_numPoints), dtype=np.int32)
-        
-        #t3 = time.time() - t0
-        #print "Transfer time 2:", t3
+            __global__ void isneighbor(float* sx, float* sy, float* sz, float* sh, float* dx, float* dy, float* dz, float* dh, float cell_size, float radius_scale, int dst_numPoints, int max_cell_pop, int* cell_indices, int* cell_map, int ncx, int ncy, int* is_nbr)
+            {
+                const unsigned int BID = blockIdx.y * gridDim.x + blockIdx.x; // block ID
+                const unsigned int LID = threadIdx.x;  // local thread ID
+                const int TPB = blockDim.x; // threads per block
+                const unsigned int k = BID * TPB + LID;
+                
+                int dpid = k/27/max_cell_pop;
+                if(dpid < dst_numPoints)
+                {
+                    int scid = (k - dpid*27*max_cell_pop)/27;
+                    int spid = k - dpid*27*max_cell_pop - scid*27;
+                    
+                    if(scid < 27)
+                    {
+                        float dxi = dx[dpid];
+                        float dyi = dy[dpid];
+                        float dzi = dz[dpid];
+                        float dhi = dh[dpid];
+                        
+                        int dcellx = (int) floor(dxi/cell_size);
+                        int dcelly = (int) floor(dyi/cell_size);
+                        int dcellz = (int) floor(dzi/cell_size);
+                        
+                        int scellx, scelly, scellz;
+                        
+                        if(scid%3 == 0) scellx = dcellx - 1;
+                        else if(scid%3 == 1) scellx = dcellx;
+                        else if(scid%3 == 2) scellx = dcellx + 1;
+                        
+                        if((scid/3)%3 == 0) scelly = dcelly - 1;
+                        else if((scid/3)%3 == 1) scelly = dcelly;
+                        else if((scid/3)%3 == 2) scelly = dcelly + 1;
+                        
+                        if((scid/9)%3 == 0) scellz = dcellz - 1;
+                        else if((scid/9)%3 == 1) scellz = dcellz;
+                        else if((scid/9)%3 == 2) scellz = dcellz + 1;
+                        
+                        if(scellx >= 0 && scelly >= 0 && scellz >= 0)
+                        { 
+                            int scelli = scellx + ncx*scelly + ncx*ncy*scellz;
+                            if(cell_map[scelli] != -1)
+                            {
+                                int spi = spid + cell_map[scelli]*max_cell_pop;
+                                float sxi = sx[cell_indices[spi]];
+                                float syi = sy[cell_indices[spi]];
+                                float szi = sz[cell_indices[spi]];
+                                float shi = sh[cell_indices[spi]];
+                                
+                                float dist = sqrt(pow((dxi-sxi), 2) + pow((dyi-syi), 2)+pow((dzi-szi), 2));
+                                float dr = radius_scale*dhi;
+                                float sr = radius_scale*shi;
+                                if(dist <= dr || dist <= sr)
+                                {
+                                    is_nbr[k] = 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            
+            /*
+            __global__ void update_ll(int* ll1, int* ll2, int* is_nbr, unsigned int len_is_nbr)
+            {
+                const unsigned int BID = blockIdx.y * gridDim.x + blockIdx.x; // block ID
+                const unsigned int LID = threadIdx.x;  // local thread ID
+                const int TPB = blockDim.x; // threads per block
+                const unsigned int k = BID * TPB + LID;
+                
+                if(k < len_is_nbr-1)
+                {
+                    if(ll1[k] != len_is_nbr)
+                    {
+                        if(is_nbr[ll1[k]]==0) ll2[k] = ll1[ll1[k]];
+                        else ll2[k] = ll1[k];
+                    }
+                    else ll2[k] = ll1[k];
+                }
+            }
+            
+            __global__ void getnbrs(int* is_nbr, int* ll, int* nbrs, int* nnbrs, int max_cell_pop, int dst_numPoints)
+            {
+                const unsigned int BID = blockIdx.y * gridDim.x + blockIdx.x; // block ID
+                const unsigned int LID = threadIdx.x;  // local thread ID
+                const int TPB = blockDim.x; // threads per block
+                const unsigned int k = BID * TPB + LID;
+                
+                if(k < dst_numPoints)
+                {
+                    int i = k*27*max_cell_pop;
+                    int n = 0;
+                    while(i < (k+1)*27*max_cell_pop)
+                    {
+                        if(is_nbr[i]==1)
+                        {
+                            nbrs[n] = i;
+                            n++;
+                            nnbrs[k] = n;
+                        }
+                        i = ll[i];
+                    }
+                }
+            }
+            */
+    """)
         
         cdef int MaxTperB = 1024
         cdef int GB_X = 16
-        cdef int blocks = (dst_numPoints + MaxTperB - 1) / MaxTperB
+        cdef int blocks = (len_is_nbr + MaxTperB - 1) / MaxTperB
         cdef int GB_Y = (blocks + GB_X - 1) / GB_X
         
-        t0 = time.time()
-        getnbrs = self.mod2.get_function("getnbrs")
-        getnbrs(s_x_gpu, s_y_gpu, s_z_gpu, s_h_gpu, d_x_gpu, d_y_gpu, d_z_gpu, d_h_gpu, np.float32(cell_size), np.float32(radius_scale), np.int32(dst_numPoints), np.int32(max_cell_pop), all_cell_indices_gpu, cell_map_gpu, np.int32(ncx), np.int32(ncy), np.int32(ncz), np.int32(ocx), np.int32(ocy), np.int32(ocz), nbrs_gpu, nnbrs_gpu, block=(MaxTperB, 1 , 1), grid=(GB_X, GB_Y, 1))
-        context.synchronize()
-        t5 = time.time() - t0
+        isneighbor = mod.get_function("isneighbor")
+        isneighbor(s_x_gpu, s_y_gpu, s_z_gpu, s_h_gpu, d_x_gpu, d_y_gpu, d_z_gpu, d_h_gpu, np.float32(cell_size), np.float32(radius_scale), np.int32(dst_numPoints), np.int32(max_cell_pop), all_cell_indices_gpu, cell_map_gpu, np.int32(ncx), np.int32(ncy), is_nbr_gpu, block=(MaxTperB, 1 , 1), grid=(GB_X, GB_Y, 1))
+        print "Woohoo0"
+        """
+        is_nbr = is_nbr_gpu.get()
+        for i in range(len(is_nbr)):
+            print is_nbr[i],
+        
+            
+        ll1 = gpuarray.arange(1, len_is_nbr+1, 1, dtype=np.uint32)
+        ll2 = gpuarray.arange(1, len_is_nbr+1, 1, dtype=np.uint32)
+        
+        update_ll = mod.get_function("update_ll")
+        ll_krnl = ReductionKernel(np.int32, neutral="0", reduce_expr='a+b',
+                          map_expr="(i < len_is_nbr-1) ? (int) (is_nbr[ll[i]] == 0 && ll[i] != len_is_nbr) : 0",
+                          arguments="int* ll, int* is_nbr, int len_is_nbr"
+                         )
+        
+        while(True):
+            update_ll(ll1, ll2, is_nbr_gpu, np.uint32(len_is_nbr), block=(MaxTperB, 1 , 1), grid=(GB_X, GB_Y, 1))
+            rem = ll_krnl(ll2, is_nbr_gpu, np.uint32(len_is_nbr)).get()
+            print rem
+            if rem == 0:
+                ll = ll2
+                print "Woohoo1"
+                break
+            update_ll(ll2, ll1, is_nbr_gpu, np.uint32(len_is_nbr), block=(MaxTperB, 1 , 1), grid=(GB_X, GB_Y, 1))
+            rem = ll_krnl(ll1, is_nbr_gpu, np.uint32(len_is_nbr)).get()
+            print rem
+            if rem == 0:
+                ll = ll1
+                print "Woohoo2"
+                break
+          
+        print "Woohoo!!"
+        nbrs_gpu = gpuarray.empty((27*max_cell_pop, dst_numPoints), dtype=np.int32)
+        nnbrs_gpu = gpuarray.empty((dst_numPoints), dtype=np.int32)
+        
+        blocks = (dst_numPoints + MaxTperB - 1) / MaxTperB
+        GB_Y = (blocks + GB_X - 1) / GB_X
+        
+        getnbrs = mod.get_function("getnbrs")
+        getnbrs(is_nbr_gpu, ll, nbrs_gpu, nnbrs_gpu, np.int32(max_cell_pop), np.int32(dst_numPoints), block=(MaxTperB, 1 , 1), grid=(GB_X, GB_Y, 1))
         nbrs = nbrs_gpu.get()
         nnbrs = nnbrs_gpu.get()
-        print "Get nbrs:", t5
-    
-    def get_nearest_particles_cuda2(self, int src_index, int dst_index,
-                                int dst_numPoints, nbrs_gpu_ptr, nnbrs_gpu_ptr, int max_cell_pop, cells_gpu, cellpop_gpu, DMP):
         """
-        Utility function to get near-neighbors for a particle.
-
-        Parameters:
-        -----------
-
-        src_index : int
-            Index of the source particle array in the particles list
-
-        dst_index : int
-            Index of the destination particle array in the particles list
-
-        d_idx : int (input)
-            Destination particle for which neighbors are sought.
-
-        nbrs : UIntArray (output)
-            Neighbors for the requested particle are stored here.
-        """
-        #tt = time.time()
-        #cdef dict cells = self.cells
-        #cdef Cell cell
-        #t0 = time.time()
-        cdef NNPSParticleArrayWrapper src = self.pa_wrappers[ src_index ]
-        cdef NNPSParticleArrayWrapper dst = self.pa_wrappers[ dst_index ]
-        #t01 = time.time() - t0
-        #print "Init time:", t01
-        #t0 = time.time()
-        # Source particle arrays -> Device
-        s_x_gpu = gpuarray.to_gpu(src.x.get_npy_array().astype(np.float32), allocator=DMP.allocate)
-        s_y_gpu = gpuarray.to_gpu(src.y.get_npy_array().astype(np.float32), allocator=DMP.allocate)
-        s_z_gpu = gpuarray.to_gpu(src.z.get_npy_array().astype(np.float32), allocator=DMP.allocate)
-        s_h_gpu = gpuarray.to_gpu(src.h.get_npy_array().astype(np.float32), allocator=DMP.allocate)
-        
-        # Destination particle arrays -> Device
-        d_x_gpu = gpuarray.to_gpu(dst.x.get_npy_array().astype(np.float32), allocator=DMP.allocate)
-        d_y_gpu = gpuarray.to_gpu(dst.y.get_npy_array().astype(np.float32), allocator=DMP.allocate)
-        d_z_gpu = gpuarray.to_gpu(dst.z.get_npy_array().astype(np.float32), allocator=DMP.allocate)
-        d_h_gpu = gpuarray.to_gpu(dst.h.get_npy_array().astype(np.float32), allocator=DMP.allocate)
-        #t1 = time.time() - t0
-        #print "Transfer time:", t1
-        #t0 = time.time()
-        cdef int ncx, ncy, ncz, ocx, ocy, ocz
-        cdef DoubleArray xmin = self.xmin
-        cdef DoubleArray xmax = self.xmax
-        cdef float cell_size = self.cell_size
-
-        # calculate the number of cells.
-        ncx = <int>ceil( 1./cell_size*(xmax.data[0] - xmin.data[0]) ) + 1
-        ncy = <int>ceil( 1./cell_size*(xmax.data[1] - xmin.data[1]) ) + 1
-        ncz = <int>ceil( 1./cell_size*(xmax.data[2] - xmin.data[2]) ) + 1
-        
-        # calculate cell offsets
-        ocx = <int>floor(xmin.data[0]/cell_size)
-        ocy = <int>floor(xmin.data[1]/cell_size)
-        ocz = <int>floor(xmin.data[2]/cell_size)
-        
-        data = gpuarray.to_gpu(np.array([ncx, ncy, ncz, ocx, ocy, ocz, dst_numPoints, max_cell_pop], dtype=np.int32))
-        
-        cdef float radius_scale = self.radius_scale
-        #print radius_scale
-        #print '#', all_cell_indices
-        #t2 = time.time() - t0
-        #print "Shaping time:", t2
-        #print '$', all_cell_indices
-        #t0 = time.time()
-        #all_cell_indices_gpu = gpuarray.to_gpu(all_cell_indices, allocator=DMP.allocate)
-        #cell_map_gpu = gpuarray.to_gpu(cell_map, allocator=DMP.allocate)
-        #t3 = time.time() - t0
-        #print "Transfer time 2:", t3
-        
-        cdef int MaxTperB = 1024
-        cdef int GB_X = 16
-        cdef int blocks = (dst_numPoints + MaxTperB - 1) / MaxTperB
-        cdef int GB_Y = (blocks + GB_X - 1) / GB_X
-        #n = gpuarray.zeros((dst_numPoints), dtype=np.int32);
-        t0 = time.time()
-        getnbrs = self.mod2.get_function("getnbrs2")
-        getnbrs(s_x_gpu, s_y_gpu, s_z_gpu, s_h_gpu, d_x_gpu, d_y_gpu, d_z_gpu, d_h_gpu, np.float32(cell_size), np.float32(radius_scale), cells_gpu, cellpop_gpu, data, nbrs_gpu_ptr, nnbrs_gpu_ptr, block=(MaxTperB, 1 , 1), grid=(GB_X, GB_Y, 1))
-        context.synchronize()
-        t5 = time.time() - t0
-        print "Get nbrs2:", t5    
 
     cpdef count_n_part_per_cell(self):
         """Count the number of particles in each cell"""
