@@ -1,4 +1,4 @@
-This is the repository for my High Performance Computing course project titled "GPU Extension for PySPH.
+This is the repository for my High Performance Computing course project titled "GPU Extension for PySPH".
 
 Additional details of the project may be found in report.pdf
 
